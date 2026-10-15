@@ -2,6 +2,7 @@
 using System;
 using System.IO;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 
 namespace Neovim.Editor
@@ -49,6 +50,23 @@ namespace Neovim.Editor
       catch (SocketException)
       {
         return true;
+      }
+      return false;
+    }
+
+    /// <summary>
+    /// Whether something is accepting TCP connections on the given local address. Unlike IsPortInUse, which tries
+    /// to bind the port itself, this doesn't report ports that merely can't be bound: binding a port inside a
+    /// Windows excluded port range (reserved by Hyper-V/WSL/Docker) fails with "access denied" even though nothing
+    /// is listening on it.
+    /// </summary>
+    public static bool IsListening(string ip, int port)
+    {
+      IPAddress addr = IPAddress.Parse(ip);
+      foreach (IPEndPoint ep in IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners())
+      {
+        if (ep.Port == port && (ep.Address.Equals(addr) || ep.Address.Equals(IPAddress.Any)))
+          return true;
       }
       return false;
     }

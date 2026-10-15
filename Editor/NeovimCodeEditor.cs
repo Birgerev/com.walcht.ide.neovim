@@ -22,6 +22,12 @@ namespace Neovim.Editor
 
     public static NeovimEditorConfig s_Config = new NeovimEditorConfig();
 
+    // Timeout for the one-off discovery processes run at startup (nvim --version, where/which). These deliberately
+    // don't use ProcessTimeout: that one is tuned to be short because it is paid on every file open, but a cold start
+    // (first launch after boot, antivirus scanning the executable) easily exceeds it, and a TimeoutException thrown
+    // from the static constructor disables the whole plugin until the next domain reload.
+    private const int k_DiscoveryTimeout = 5000;
+
     // Unique identifier for this Unity instance (PID)
     public static readonly string s_InstanceId = Process.GetCurrentProcess().Id.ToString();
 
@@ -269,7 +275,15 @@ namespace Neovim.Editor
       {
         proc.StartInfo.FileName = p;
         proc.StartInfo.Arguments = "--version";
-        proc.RunWithAssertion(s_Config.ProcessTimeout);
+        try
+        {
+          proc.RunWithAssertion(k_DiscoveryTimeout);
+        }
+        catch (Exception e)
+        {
+          Debug.LogWarning($"[neovim.ide] couldn't query the version of `{p}`. Reason: {e.Message}");
+          return version;
+        }
         var line = proc.StandardOutput.ReadLine();
         if (line != null)
         {
@@ -297,12 +311,12 @@ namespace Neovim.Editor
       // if nvim executable path is already set in the config - check if it is still valid
       if (!string.IsNullOrWhiteSpace(s_Config.NvimExecutablePath))
       {
-        string v;
-        if (File.Exists(s_Config.NvimExecutablePath)
-            && (v = GetNeovimVersion(s_Config.NvimExecutablePath)) != "v-unknown")
+        // only the file's existence decides validity: a failed version query (e.g. a slow cold start) must not make
+        // the plugin throw away the path the user picked and silently fall back to discovery
+        if (File.Exists(s_Config.NvimExecutablePath))
         {
           s_DiscoveredNeovimInstallations = new CodeEditor.Installation[] { new CodeEditor.Installation() {
-            Name = $"Neovim {v}",
+            Name = $"Neovim {GetNeovimVersion(s_Config.NvimExecutablePath)}",
             Path = s_Config.NvimExecutablePath
           }};
         }
@@ -320,7 +334,7 @@ namespace Neovim.Editor
       if (!s_DiscoveredNeovimInstallations.Any())
       {
         s_DiscoveredNeovimInstallations = s_CandidateNeovimPaths
-          .Select(p => p = Path.IsPathRooted(p) ? p : ProcessUtils.CmdPath(p, s_Config.ProcessTimeout))
+          .Select(p => p = Path.IsPathRooted(p) ? p : ProcessUtils.CmdPath(p, k_DiscoveryTimeout))
           .Where(p => p != null && File.Exists(p))
           .Select(p =>
           {
@@ -351,7 +365,7 @@ namespace Neovim.Editor
 
       if (s_LinuxPlatform == LinuxDesktopEnvironment.X11)
       {
-        if (ProcessUtils.CmdPath("wmctrl", s_Config.ProcessTimeout) == null)
+        if (ProcessUtils.CmdPath("wmctrl", k_DiscoveryTimeout) == null)
         {
           Debug.LogWarning("[neovim.ide] neovim window focusing feature is not available \n"
               + "Reason: cmd 'wmctrl' is not available. Please install 'wmctrl' for window focusing capability.");
@@ -471,7 +485,7 @@ namespace Neovim.Editor
           if (!File.Exists(cmd))
             return false;
         }
-        else if (ProcessUtils.CmdPath(cmd, s_Config.ProcessTimeout) == null)
+        else if (ProcessUtils.CmdPath(cmd, k_DiscoveryTimeout) == null)
           return false;
       }
 
@@ -631,15 +645,17 @@ namespace Neovim.Editor
 #else  // UNITY_EDITOR_WIN
       // this is tricky... using PIDs did not work... domain sockets have an issue on the side of NeoVim...
       // since on Windows we use a randomly available port for the TCP NeoVim server socket, we can know
-      // whether a NeoVim server instance is running by trying to bind a TCP listener to the previously used
-      // port
+      // whether a NeoVim server instance is running by checking whether something is listening on the
+      // previously used port. Don't test this by binding the port ourselves: a port that can't be bound is not
+      // necessarily in use (e.g. Hyper-V/WSL/Docker reserve port ranges at boot, and binding those fails with
+      // "access denied" while nothing listens), which would leave the plugin believing Neovim is running forever.
       string prevAddr = s_Config.PrevServerSocket;
       if (string.IsNullOrWhiteSpace(prevAddr)) return false;
 
       int idx = prevAddr.IndexOf(':');
       string ip = prevAddr.Substring(0, idx);
       int port = int.Parse(prevAddr.Substring(idx + 1));
-      return NetUtils.IsPortInUse(ip, port);
+      return NetUtils.IsListening(ip, port);
 #endif
     }
 
@@ -720,6 +736,12 @@ namespace Neovim.Editor
     /// <returns>whether the nvim server instance is successfully instantied.</returns>
     private bool TryInstantiateNvimServerInstance(string app, string filePath)
     {
+#if UNITY_EDITOR_WIN
+      // Always start a new server on a fresh port. After every file open, s_ServerSocket is overwritten with the
+      // previously used address, so without this a relaunch would reuse that port even though it may have been
+      // taken or reserved since, in which case the new Neovim can't listen on it.
+      s_ServerSocket = $"127.0.0.1:{NetUtils.GetRandomAvailablePort()}";
+#endif
       try
       {
         using (var p = new Process())
